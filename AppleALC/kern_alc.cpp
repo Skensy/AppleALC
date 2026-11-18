@@ -449,7 +449,7 @@ void AlcEnabler::processKext(KernelPatcher &patcher, size_t index, mach_vm_addre
 #ifdef HAVE_ANALOG_AUDIO
 	if (kextIndex == KextIdAppleGFXHDA) {
 		KernelPatcher::RouteRequest request("__ZN21AppleGFXHDAController5probeEP9IOServicePi", gfxProbe, orgGfxProbe);
-		patcher.routeMultiple(index, &request, 1, address, size);
+		patcher.routeMultipleLong(index, &request, 1, address, size);
 		return;
 	}
 
@@ -686,12 +686,13 @@ IOReturn AlcEnabler::performPowerChange(IOService *hdaDriver, uint32_t from, uin
 			if (pin) {
 				if (to == ALCAudioDeviceSleep) {
 					hdaCodec->setProperty("alc-sleep-status", kOSBooleanTrue);
-				} else if (sleep && (to == ALCAudioDeviceIdle || to == ALCAudioDeviceActive)) {
+				} else if (sleep && callbackAlc->orgInitializePinConfig && (to == ALCAudioDeviceIdle || to == ALCAudioDeviceActive)) {
 					DBGLOG("alc", "power change %s at %s forcing wake verbs", safeString(hdaDriver->getName()), safeString(hdaCodec->getName()));
 					auto forceRet = FunctionCast(initializePinConfig, callbackAlc->orgInitializePinConfig)(hdaCodec, hdaCodec);
 					SYSLOG_COND(forceRet != kIOReturnSuccess, "alc", "power change %s at %s forcing wake returned %08X",
 								safeString(hdaDriver->getName()), safeString(hdaCodec->getName()), forceRet);
-					hdaCodec->setProperty("alc-sleep-status", kOSBooleanFalse);
+					if (forceRet == kIOReturnSuccess)
+						hdaCodec->setProperty("alc-sleep-status", kOSBooleanFalse);
 				}
 			}
 
@@ -780,7 +781,6 @@ void AlcEnabler::patchPinConfig(IOService *hdaCodec, IORegistryEntry *configDevi
 					auto arr = OSArray::withObjects(&objForArr, 1);
 					if (arr != nullptr) {
 						configDevice->setProperty("HDAConfigDefault", arr);
-						newConfig->retain();
 						arr->release();
 					}
 
@@ -810,12 +810,11 @@ void AlcEnabler::patchPinConfig(IOService *hdaCodec, IORegistryEntry *configDevi
 					objForArr = newConfigObj;
 					arr = OSArray::withObjects(&objForArr, 1);
 					if (arr != nullptr) {
-						hdaCodec->setProperty("HDAConfigDefault", arr);
-						hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanTrue);
+						if (hdaCodec->setProperty("HDAConfigDefault", arr))
+							hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanTrue);
 						arr->release();
-					} else {
-						newConfig->release();
 					}
+					newConfig->release();
 
 					break;
 				}
