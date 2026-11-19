@@ -132,7 +132,7 @@ void AlcEnabler::updateProperties() {
 						static constexpr size_t RegTCSEL = 0x44;
 						auto value = hdef->configRead8(RegTCSEL);
 						DBGLOG("alc", "updating TCSEL register %X", value);
-						hdef->configWrite8(RegTCSEL, getBitField<uint8_t>(value, 7, 3));
+						hdef->configWrite8(RegTCSEL, static_cast<uint8_t>(value & ~0x7));
 					} else {
 						SYSLOG("alc", "cannot access HDEF pci");
 					}
@@ -614,7 +614,7 @@ void AlcEnabler::grabControllers() {
 			WIOKit::getOSDataValue(sect, "revision-id", rev) &&
 			WIOKit::getOSDataValue(sect, "alc-layout-id", lid)) {
 
-			insertController(ven, dev, rev, ControllerModInfo::PlatformAny, nullptr != sect->getProperty("no-controller-patch"), lid, sect);
+			insertController(ven, dev, rev, nullptr != sect->getProperty("no-controller-patch"), ControllerModInfo::PlatformAny, lid, sect);
 		} else {
 			SYSLOG("alc", "failed to obtain device info for analog controller (%d)", devInfo->audioBuiltinAnalog != nullptr);
 		}
@@ -671,6 +671,8 @@ void AlcEnabler::validateControllers() {
 #ifdef HAVE_ANALOG_AUDIO
 IOReturn AlcEnabler::performPowerChange(IOService *hdaDriver, uint32_t from, uint32_t to, unsigned int *timer) {
 	IOReturn ret = FunctionCast(performPowerChange, callbackAlc->orgPerformPowerChange)(hdaDriver, from, to, timer);
+	if (ret != kIOReturnSuccess)
+		return ret;
 
 	auto hdaCodec = hdaDriver ? OSDynamicCast(IOService, hdaDriver->getParentEntry(gIOServicePlane)) : nullptr;
 	if (hdaCodec) {
@@ -724,9 +726,6 @@ void AlcEnabler::patchPinConfig(IOService *hdaCodec, IORegistryEntry *configDevi
 			safeString(hdaCodec->getName()), CASTKADDR(hdaCodec), CASTKADDR(configDevice),
 			configDevice ? safeString(configDevice->getName()) : "(null config)", appleLayout, analogCodec, analogLayout);
 
-		hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanFalse);
-		hdaCodec->setProperty("alc-sleep-status", kOSBooleanFalse);
-
 		auto alcSelf = ADDPR(selfInstance);
 		if (!alcSelf) {
 			SYSLOG("alc", "invalid self reference");
@@ -772,20 +771,38 @@ void AlcEnabler::patchPinConfig(IOService *hdaCodec, IORegistryEntry *configDevi
 					// Replace the config list with a new list to avoid multiple iterations,
 					// and actually fix the LayoutID number we hook in.
 					auto num = OSNumber::withNumber(appleLayout, 32);
-					if (num != nullptr) {
-						newConfig->setObject("LayoutID", num);
-						num->release();
+					if (num == nullptr) {
+						SYSLOG("alc", "failed to allocate LayoutID for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
+					}
+					bool layoutUpdated = newConfig->setObject("LayoutID", num);
+					num->release();
+					if (!layoutUpdated) {
+						SYSLOG("alc", "failed to update LayoutID for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
 					}
 
 					const OSObject *objForArr = newConfigObj;
 					auto arr = OSArray::withObjects(&objForArr, 1);
-					if (arr != nullptr) {
-						configDevice->setProperty("HDAConfigDefault", arr);
-						arr->release();
+					if (arr == nullptr) {
+						SYSLOG("alc", "failed to allocate boot config array for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
+					}
+					bool bootPublished = configDevice->setProperty("HDAConfigDefault", arr);
+					arr->release();
+					if (!bootPublished) {
+						SYSLOG("alc", "failed to publish boot config for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
 					}
 
 					if (!reinit) {
 						// We do not need to reinit, thus are done.
+						if (hdaCodec->setProperty("alc-sleep-status", kOSBooleanFalse))
+							hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanFalse);
 						newConfig->release();
 						break;
 					}
@@ -800,20 +817,31 @@ void AlcEnabler::patchPinConfig(IOService *hdaCodec, IORegistryEntry *configDevi
 						break;
 					}
 
+					bool wakeUpdated = true;
 					if (wakeConfigData != nullptr) {
-						if (configData != nullptr) {
-							newConfig->setObject("BootConfigData", configData);
-						}
-						newConfig->setObject("ConfigData", wakeConfigData);
+						if (configData != nullptr)
+							wakeUpdated = newConfig->setObject("BootConfigData", configData);
+						wakeUpdated = wakeUpdated && newConfig->setObject("ConfigData", wakeConfigData);
 						newConfig->removeObject("WakeConfigData");
 					}
+					if (!wakeUpdated) {
+						SYSLOG("alc", "failed to update wake config for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
+					}
+
 					objForArr = newConfigObj;
 					arr = OSArray::withObjects(&objForArr, 1);
-					if (arr != nullptr) {
-						if (hdaCodec->setProperty("HDAConfigDefault", arr))
-							hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanTrue);
-						arr->release();
+					if (arr == nullptr) {
+						SYSLOG("alc", "failed to allocate wake config array for analog HDAConfigDefault %u", i);
+						newConfig->release();
+						break;
 					}
+					bool wakePublished = hdaCodec->setProperty("HDAConfigDefault", arr);
+					bool sleepCleared = wakePublished && hdaCodec->setProperty("alc-sleep-status", kOSBooleanFalse);
+					if (sleepCleared)
+						hdaCodec->setProperty("alc-pinconfig-status", kOSBooleanTrue);
+					arr->release();
 					newConfig->release();
 
 					break;
